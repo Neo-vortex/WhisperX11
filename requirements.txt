@@ -1,0 +1,12 @@
+# PyTorch is not listed on purpose: install the build for your GPU (see install.sh / README).
+# openai-whisper is installed with --no-deps for the same reason; these are its other dependencies.
+numba
+numpy
+tiktoken
+more-itertools
+tqdm
+# app
+sounddevice
+pynput
+python-xlib
+PySide6
