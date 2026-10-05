@@ -2,6 +2,7 @@
 # openai-whisper is installed with --no-deps for the same reason; these are its other dependencies.
 numba
 numpy
+scipy
 tiktoken
 more-itertools
 tqdm

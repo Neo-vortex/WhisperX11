@@ -23,7 +23,7 @@ ASSETS = os.path.join(ROOT, "assets")
 os.makedirs(ASSETS, exist_ok=True)
 
 SCALE = 2
-W, H = 760, 330
+W, H = 760, 370
 FPS = 25
 TYPED = ["Meeting notes", "", "سلام! جلسه فردا ساعت ده برگزار می‌شود.", "Let's ship the new release on Friday."]
 
@@ -101,12 +101,20 @@ def speech_envelope(t):
 
 
 def demo_gif():
+    """Streaming demo: caption grows while speaking, each sentence is typed at the next pause."""
     o = dictate.Overlay()
     frames = []
-    pointer = (300, 196)
-    timeline = [("idle", 0.8), ("listening", 2.6), ("thinking", 0.9), ("done", 1.0), ("after", 1.4)]
+    pointer = (300, 206)
+    s1, s2 = TYPED[2], TYPED[3]
+    # (phase, seconds); speech: s1 0.0-2.0, pause, s2 2.7-4.6, trailing silence
+    timeline = [("idle", 0.6), ("listening", 5.2), ("thinking", 0.5), ("done", 1.0), ("after", 1.3)]
     sim_t = 0.0
     lines = TYPED[:2]
+
+    def grow(sentence, progress):
+        words = sentence.split()
+        return " ".join(words[:max(1, int(progress * len(words) + 0.5))])
+
     for phase, dur in timeline:
         n = int(dur * FPS)
         for f in range(n):
@@ -117,17 +125,24 @@ def demo_gif():
             elif phase == "listening":
                 o.mode = "listening"
                 o.opacity = min(1.0, local / 0.18)
-                o.level = speech_envelope(local) if local < 2.1 else 0.03
+                speaking = local < 2.0 or 2.7 <= local < 4.6
+                o.level = speech_envelope(local) if speaking else 0.03
                 k = 0.45 if o.level > o.shown_level else 0.12
                 o.shown_level += (o.level - o.shown_level) * k
                 if f % 2 == 0:
                     o.history.append(o.shown_level)
+                if 0.7 <= local < 2.6:
+                    o.caption = grow(s1, min(1.0, (local - 0.7) / 1.3))
+                elif 2.6 <= local < 2.64:  # pause detected: sentence 1 is typed
+                    lines, o.flash, o.caption = TYPED[:3], 0.6, s1
+                elif local >= 3.3:
+                    o.caption = grow(s2, min(1.0, (local - 3.3) / 1.3))
             elif phase == "thinking":
                 o.mode = "thinking"
                 o.shown_level *= 0.8
             elif phase == "done":
                 if f == 0:
-                    o.mode, o.flash = "done", 1.0
+                    o.mode, o.flash, o.caption = "done", 1.0, s2
                     lines = TYPED
                 o.flash *= 0.9
                 o.opacity = 1.0 if local < 0.55 else max(0.0, 1 - (local - 0.55) / 0.3)
@@ -141,9 +156,7 @@ def demo_gif():
             draw_pointer(p, *pointer)
             if o.opacity > 0.01:
                 ov = overlay_image(o, sim_t)
-                px = pointer[0] + 18 - (o.W - o.PW) // 2
-                py = pointer[1] + 22 - (o.H - o.PH) // 2
-                p.drawImage(QPointF(px, py), ov)
+                p.drawImage(QPointF(pointer[0] + 18 - o.PX, pointer[1] + 22 - o.PY), ov)
             p.end()
             frames.append(qimage_to_pil(img).resize((W, H), Image.LANCZOS).convert("RGB"))
 
@@ -157,17 +170,22 @@ def states_png():
     o = dictate.Overlay()
     o.opacity = 1.0
     hist = [abs(math.sin(i * 0.6)) * 0.9 * (0.4 + 0.6 * ((i * 7) % 5) / 5) for i in range(o.BARS)]
-    cell_w, cell_h = o.W, o.H
-    sheet = QImage(cell_w * 3 * SCALE, cell_h * SCALE, QImage.Format_ARGB32_Premultiplied)
+    states = [("listening", 0.7, 0, 1.3, "Let's ship the new release"),
+              ("thinking", 0, 0, 2.1, TYPED[2]),
+              ("done", 0, 0.7, 1.0, "")]
+    rows = [o.PY + o.PH + (70 if cap else 40) for *_, cap in states]
+    width = o.PX + o.PW + o.PX
+    sheet = QImage(width * SCALE, (sum(rows) + 10) * SCALE, QImage.Format_ARGB32_Premultiplied)
     sheet.setDevicePixelRatio(SCALE)
     sheet.fill(QColor("#0f1117"))
     p = QPainter(sheet)
-    for i, (mode, level, flash, t) in enumerate([("listening", 0.7, 0, 1.3), ("thinking", 0, 0, 2.1),
-                                                 ("done", 0, 0.7, 1.0)]):
-        o.mode, o.shown_level, o.flash = mode, level, flash
+    y = 0
+    for (mode, level, flash, t, caption), h in zip(states, rows):
+        o.mode, o.shown_level, o.flash, o.caption = mode, level, flash, caption
         o.history.clear()
         o.history.extend(hist if mode != "thinking" else [0] * o.BARS)
-        p.drawImage(QPointF(i * cell_w, 0), overlay_image(o, t))
+        p.drawImage(QPointF(0, y - 10), overlay_image(o, t))
+        y += h
     p.end()
     out = os.path.join(ASSETS, "states.png")
     sheet.save(out)

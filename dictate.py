@@ -2,9 +2,11 @@
 """Push-to-dictate with OpenAI Whisper on X11.
 
 Press the hotkey: a glowing overlay appears at the mouse pointer and starts listening.
-Press the hotkey again (or just stop talking) and the text is pasted into the
-focused window (clipboard + simulated Ctrl+V, Ctrl+Shift+V in terminals, which
-works for Persian and any keyboard layout). Esc cancels.
+While you talk, every short pause ends a segment that is transcribed and typed
+right away; the part still being spoken is previewed under the overlay. Press the
+hotkey again (or stop talking) to finish. Text is typed into the focused window via XTest, with spare keycodes temporarily remapped to the needed
+characters, so it works for Persian and any keyboard layout without touching the
+clipboard (--insert paste uses clipboard + Ctrl+V instead). Esc cancels.
 """
 
 import argparse
@@ -19,6 +21,7 @@ import time
 from collections import deque
 
 import numpy as np
+from scipy.signal import resample_poly
 import sounddevice as sd
 import torch
 import whisper
@@ -31,7 +34,7 @@ from Xlib import X, XK, display
 from Xlib.ext import xtest
 
 SAMPLE_RATE = 16000
-BLOCK = 1600  # 100 ms
+BLOCKS_PER_SEC = 10  # audio is handled in 100 ms blocks
 TERMINALS = {"xfce4-terminal", "gnome-terminal", "gnome-terminal-server", "konsole", "kitty", "alacritty",
              "xterm", "uxterm", "urxvt", "terminator", "tilix", "wezterm", "foot", "st", "lxterminal",
              "mate-terminal", "qterminal", "terminology", "guake", "tilda", "ghostty", "warp"}
@@ -45,48 +48,87 @@ def parse_args():
                                 fromfile_prefix_chars="@")
     p.add_argument("--model", default="turbo",
                    help="multilingual whisper model: tiny, base, small, medium, turbo, large")
+    p.add_argument("--cpu", action="store_true", help="run on the CPU even if a GPU is available")
+    p.add_argument("--insert", choices=["type", "paste"], default="type",
+                   help="type: simulated keystrokes, clipboard untouched; "
+                        "paste: clipboard + Ctrl+V (instant for long text)")
     p.add_argument("--languages", default="en,fa",
                    help="comma-separated languages to choose between per utterance (one = fixed)")
     p.add_argument("--hotkey", default="<ctrl>+<alt>+<space>", help="pynput hotkey syntax")
     p.add_argument("--device", default=None,
                    help="input device name (substring) or index, see --list-devices (default: system default)")
     p.add_argument("--list-devices", action="store_true", help="print audio input devices and exit")
-    p.add_argument("--silence", type=float, default=1.5,
+    p.add_argument("--silence", type=float, default=2.5,
                    help="auto-stop after this many seconds of silence once speech started (0 = off)")
-    p.add_argument("--max-seconds", type=float, default=120)
+    p.add_argument("--pause", type=float, default=0.6,
+                   help="a pause this long (seconds) ends a segment, which is transcribed and inserted right away")
+    p.add_argument("--max-segment", type=float, default=20,
+                   help="cut segments longer than this (seconds) at their quietest moment")
+    p.add_argument("--no-preview", action="store_true", help="don't show the live caption while speaking")
+    p.add_argument("--max-seconds", type=float, default=300)
     p.add_argument("--threshold", type=float, default=0.03,
                    help="minimum RMS level counted as speech (raised automatically above room noise)")
     return p.parse_args()
 
 
 class Recorder:
+    """Captures mono audio in 100 ms blocks and flags each block as speech or not."""
+
     def __init__(self, device, threshold):
         self.device = int(device) if device and str(device).isdigit() else device
         self.threshold = threshold
-        self.chunks, self.levels = [], []
+        self.rate = SAMPLE_RATE
+        self.stream = None
+        self._reset()
+
+    def _reset(self):
+        self.chunks, self.voiced, self.block_levels, self.levels = [], [], [], []
         self.level = self.noise = 0.0
         self.last_voice = None
-        self.started = None
-        self.stream = None
+        self.started = time.monotonic()
 
     def start(self):
-        self.chunks, self.levels, self.level, self.noise, self.last_voice = [], [], 0.0, 0.0, None
-        self.started = time.monotonic()
-        self.stream = sd.InputStream(device=self.device, samplerate=SAMPLE_RATE, channels=1,
-                                     dtype="float32", blocksize=BLOCK, callback=self._callback)
+        self._reset()
+        try:
+            self._open(SAMPLE_RATE)
+        except sd.PortAudioError:
+            # raw ALSA devices often can't do 16 kHz: record at the native rate and resample
+            self._open(int(sd.query_devices(self.device, "input")["default_samplerate"]))
+
+    def _open(self, rate):
+        self.rate = rate
+        self.stream = sd.InputStream(device=self.device, samplerate=rate, channels=1, dtype="float32",
+                                     blocksize=rate // BLOCKS_PER_SEC, callback=self._callback)
         self.stream.start()
 
     def _callback(self, indata, frames, t, status):
         chunk = indata[:, 0].copy()
-        self.chunks.append(chunk)
         level = float(np.sqrt(np.mean(chunk ** 2)))
-        if len(self.chunks) == 1:  # skip the click when the device opens
-            return
-        self.level = level
-        self.levels.append(level)
-        self.noise = float(np.percentile(self.levels, 10)) if len(self.levels) >= 3 else level
-        if level > max(self.threshold, self.noise * 2.5):
-            self.last_voice = time.monotonic()
+        voiced = False
+        if self.chunks:  # the first block holds the click of the device opening
+            self.level = level
+            self.levels.append(level)
+            self.noise = float(np.percentile(self.levels, 10)) if len(self.levels) >= 3 else level
+            voiced = level > max(self.threshold, self.noise * 2.5)
+            if voiced:
+                self.last_voice = time.monotonic()
+        self.voiced.append(voiced)
+        self.block_levels.append(level if self.chunks else 0.0)
+        self.chunks.append(chunk)
+
+    def blocks(self):
+        return len(self.chunks)
+
+    def audio(self, start=0, end=None):
+        """16 kHz float32 audio of blocks [start, end)."""
+        chunks = self.chunks[start:end]
+        if not chunks:
+            return np.zeros(0, np.float32)
+        x = np.concatenate(chunks)
+        if self.rate != SAMPLE_RATE:
+            g = math.gcd(SAMPLE_RATE, self.rate)
+            x = resample_poly(x, SAMPLE_RATE // g, self.rate // g).astype(np.float32)
+        return x
 
     def loudness(self):
         """Voice level above the noise floor, roughly 0..1."""
@@ -97,14 +139,15 @@ class Recorder:
             self.stream.stop()
             self.stream.close()
             self.stream = None
-        return np.concatenate(self.chunks) if self.chunks else np.zeros(0, np.float32)
 
 
 class Overlay(QWidget):
-    """Frameless, click-through, never-focused glowing pill."""
+    """Frameless, click-through, never-focused glowing pill, with a live caption below it."""
 
-    W, H = 380, 130          # window, including room for the glow
+    W, H = 620, 190          # window, including room for the glow and the caption
+    PX, PY = 40, 36          # pill position inside the window
     PW, PH = 300, 58         # the pill itself
+    CAPTION_W = 540
     BARS = 26
     PALETTE = ["#8B5CF6", "#3B82F6", "#22D3EE", "#F472B6", "#8B5CF6"]
     LABELS = {"listening": "Listening", "thinking": "Thinking", "done": "Inserted", "empty": "No speech"}
@@ -121,6 +164,7 @@ class Overlay(QWidget):
         self.history = deque([0.0] * self.BARS, maxlen=self.BARS)
         self.opacity = self.target_opacity = 0.0
         self.flash = 0.0
+        self.caption = ""
         self.t0 = time.monotonic()
         self.frame = 0
         self.font = QFont("Inter")
@@ -128,6 +172,9 @@ class Overlay(QWidget):
         self.font.setPointSizeF(10.5)
         self.font.setWeight(QFont.DemiBold)
         self.font.setLetterSpacing(QFont.AbsoluteSpacing, 0.3)
+        self.caption_font = QFont("Inter")
+        self.caption_font.setFamilies(["Inter", "Vazirmatn", "Noto Sans Arabic", "DejaVu Sans"])
+        self.caption_font.setPointSizeF(11)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._animate)
         self.timer.start(16)
@@ -136,12 +183,13 @@ class Overlay(QWidget):
     def popup(self):
         pos = QCursor.pos()
         g = (QGuiApplication.screenAt(pos) or QGuiApplication.primaryScreen()).geometry()
-        mx, my = (self.W - self.PW) // 2, (self.H - self.PH) // 2
+        mx, my = self.PX, self.PY
         px = min(max(pos.x() + 18, g.left() + 8), g.right() - self.PW - 8)
         py = min(max(pos.y() + 22, g.top() + 8), g.bottom() - self.PH - 8)
         self.move(px - mx, py - my)
         self.history = deque([0.0] * self.BARS, maxlen=self.BARS)
         self.level = self.shown_level = self.flash = 0.0
+        self.caption = ""
         self.mode = "listening"
         self.target_opacity = 1.0
         self.show()
@@ -183,12 +231,11 @@ class Overlay(QWidget):
         t = time.monotonic() - self.t0
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+        rect = QRectF(self.PX, self.PY, self.PW, self.PH)
         s = 0.92 + 0.08 * self.opacity
-        p.translate(self.W / 2, self.H / 2)
+        p.translate(rect.center())
         p.scale(s, s)
-        p.translate(-self.W / 2, -self.H / 2)
-
-        rect = QRectF((self.W - self.PW) / 2, (self.H - self.PH) / 2, self.PW, self.PH)
+        p.translate(-rect.center())
         r = self.PH / 2
         thinking = self.mode == "thinking"
         spin = (t * (220 if thinking else 70)) % 360
@@ -228,7 +275,30 @@ class Overlay(QWidget):
         self._paint_orb(p, QPointF(rect.left() + 29, rect.center().y()), t, thinking)
         self._paint_bars(p, QRectF(rect.left() + 54, rect.top() + 11, 150, rect.height() - 22), t, thinking)
         self._paint_label(p, QRectF(rect.left() + 214, rect.top(), 78, rect.height()), t)
+        if self.caption:
+            self._paint_caption(p, rect, ring)
         p.end()
+
+    def _paint_caption(self, p, pill, ring):
+        p.setFont(self.caption_font)
+        fm = p.fontMetrics()
+        text = fm.elidedText(self.caption, Qt.ElideLeft, self.CAPTION_W - 32)
+        box = QRectF(pill.left(), pill.bottom() + 12, fm.horizontalAdvance(text) + 32, fm.height() + 18)
+        p.setOpacity(self.opacity * 0.95)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(14, 14, 24, 228))
+        p.drawRoundedRect(box, 12, 12)
+        p.setOpacity(self.opacity * 0.55)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QBrush(ring), 1.1))
+        p.drawRoundedRect(box.adjusted(0.5, 0.5, -0.5, -0.5), 12, 12)
+        p.setOpacity(self.opacity)
+        p.setPen(QColor(232, 232, 245))
+        # base direction from the first strong character, so Persian punctuation lands on the right side
+        strong = next((c for c in self.caption if c.isalpha()), "a")
+        p.setLayoutDirection(Qt.RightToLeft if "\u0590" <= strong <= "\u08ff" else Qt.LeftToRight)
+        p.drawText(box.adjusted(16, 0, -16, 0), Qt.AlignVCenter | Qt.AlignAbsolute | Qt.AlignLeft, text)
+        p.setLayoutDirection(Qt.LeftToRight)
 
     def _paint_orb(self, p, c, t, thinking):
         base = 8.5 + 3.5 * self.shown_level + 1.0 * math.sin(t * 3)
@@ -312,10 +382,66 @@ class Paster:
         self.d.sync()
 
 
+class Typer:
+    """Types any Unicode text via XTest without the clipboard.
+
+    Simulating real keys breaks with multiple layouts (us,ir): the same keycode means different
+    characters per group. Instead, spare (unmapped) keycodes are temporarily bound to the needed
+    keysyms in every group and level, pressed, then unbound again.
+    """
+
+    KEY_DELAY = 0.003  # between keystrokes
+    SETTLE = 0.05      # let clients pick up a keymap change before/after using it
+
+    def __init__(self):
+        self.d = display.Display()
+
+    @staticmethod
+    def _keysym(ch):
+        c = ord(ch)
+        return c if 0x20 <= c <= 0x7E or 0xA0 <= c <= 0xFF else 0x01000000 + c
+
+    def type(self, text):
+        lo, hi = self.d.display.info.min_keycode, self.d.display.info.max_keycode
+        keymap = self.d.get_keyboard_mapping(lo, hi - lo + 1)
+        per = len(keymap[0])
+        spare = [lo + i for i, syms in enumerate(keymap) if not any(syms)]
+        if not spare:
+            raise RuntimeError("no spare keycodes to type with; use --insert paste")
+        used, i = set(), 0
+        try:
+            while i < len(text):
+                # bind as many distinct characters as there are spare keycodes, then type them
+                batch, j = {}, i
+                while j < len(text) and (text[j] in batch or len(batch) < len(spare)):
+                    if text[j] not in batch:
+                        batch[text[j]] = spare[len(batch)]
+                    j += 1
+                for ch, kc in batch.items():
+                    self.d.change_keyboard_mapping(kc, [[self._keysym(ch)] * per])
+                    used.add(kc)
+                self.d.sync()
+                time.sleep(self.SETTLE)
+                for ch in text[i:j]:
+                    xtest.fake_input(self.d, X.KeyPress, batch[ch])
+                    xtest.fake_input(self.d, X.KeyRelease, batch[ch])
+                    self.d.sync()
+                    time.sleep(self.KEY_DELAY)
+                time.sleep(self.SETTLE)
+                i = j
+        finally:
+            for kc in used:
+                self.d.change_keyboard_mapping(kc, [[0] * per])
+            self.d.sync()
+
+
 class App:
+    """Streams while you talk: every pause ends a segment, which is transcribed and inserted
+    right away while recording continues. The segment still being spoken is previewed live."""
+
     def __init__(self, args):
         self.args = args
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
         print(f"loading whisper '{args.model}' on {self.device} ...", flush=True)
         self.model = whisper.load_model(args.model, device=self.device)
         self.fp16 = self.device == "cuda"
@@ -330,9 +456,19 @@ class App:
         print(f"ready — press {args.hotkey} to dictate, Esc to cancel", flush=True)
 
         self.recorder = Recorder(args.device, args.threshold)
-        self.state = "idle"  # idle | recording | transcribing
-        self.events = queue.Queue()
         self.paster = Paster()
+        self.typer = Typer()
+        self.state = "idle"       # idle | recording | finishing
+        self.session = 0          # bumps on every start/cancel; stale results are dropped
+        self.seg_start = 0        # first block of the segment being spoken
+        self.pending = 0          # segments queued or being transcribed
+        self.produced = False
+        self.prompt, self.prompt_lang = "", None
+        self.last_partial = 0.0
+        self.events = queue.Queue()   # -> Qt main thread
+        self.jobs = queue.Queue()     # -> transcription worker
+        self.inserts = deque()        # finished texts waiting to be typed/pasted, in order
+        self.inserting = False
         self.held = set()
 
         self.qapp = QApplication.instance() or QApplication(sys.argv)
@@ -342,6 +478,7 @@ class App:
         self.hotkey = keyboard.HotKey(keyboard.HotKey.parse(args.hotkey), lambda: self.events.put("toggle"))
         self.listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
         self.listener.start()
+        threading.Thread(target=self._worker, daemon=True).start()
         self.tick = QTimer()
         self.tick.timeout.connect(self._tick)
         self.tick.start(20)
@@ -367,9 +504,14 @@ class App:
         if self.state == "recording":
             r, now = self.recorder, time.monotonic()
             self.overlay.level = r.loudness()
+            self._segment()
             silent = self.args.silence and r.last_voice and now - r.last_voice > self.args.silence
             if silent or now - r.started > self.args.max_seconds:
-                self._handle("toggle")
+                self._stop()
+        self._pump_inserts()
+        if self.state == "finishing" and not self.pending and not self.inserts and not self.inserting:
+            self.state = "idle"
+            self.overlay.set_mode("done" if self.produced else "empty")
 
     def _handle(self, event):
         if event == "toggle" and self.state == "idle":
@@ -378,39 +520,108 @@ class App:
             except Exception as e:
                 print(f"audio error: {e}", flush=True)
                 return
+            self.session += 1
+            self.seg_start, self.pending, self.produced = 0, 0, False
+            self.prompt, self.prompt_lang = "", None
             self.state = "recording"
             self.overlay.popup()
         elif event == "toggle" and self.state == "recording":
-            audio = self.recorder.stop()
-            self.state = "transcribing"
-            self.overlay.level = 0.0
-            self.overlay.set_mode("thinking")
-            threading.Thread(target=self._transcribe, args=(audio,), daemon=True).start()
+            self._stop()
         elif event == "cancel" and self.state == "recording":
             self.recorder.stop()
+            self.session += 1
+            self.pending = 0
             self.state = "idle"
             self.overlay.dismiss()
-        elif isinstance(event, tuple) and event[0] == "done":
-            if event[1]:
-                self.overlay.set_mode("done")
-                self._paste(event[1], time.monotonic() + 3.0)
-            else:
-                self.overlay.set_mode("empty")
-                self.state = "idle"
+        elif event == "inserted":
+            self.inserting = False
+        elif event[0] == "segment" and event[1] == self.session:
+            self.pending -= 1
+            if event[2]:
+                self.produced = True
+                self.inserts.append(event[2])
+                self.overlay.caption = event[2]
+                self.overlay.flash = 0.6
+        elif event[0] == "partial" and event[1] == self.session and event[2] == self.seg_start:
+            if self.state == "recording" and event[3]:
+                self.overlay.caption = event[3]
 
-    def _transcribe(self, audio):
-        text = ""
+    def _stop(self):
+        self.recorder.stop()
+        self._cut(self.recorder.blocks())
+        self.state = "finishing"
+        self.overlay.level = 0.0
+        self.overlay.set_mode("thinking")
+
+    # --- segmentation (main thread) --------------------------------------------
+    def _segment(self):
+        r, n = self.recorder, self.recorder.blocks()
+        voiced = r.voiced[self.seg_start:n]
+        if not any(voiced):
+            if n - self.seg_start > 3 * BLOCKS_PER_SEC:  # long silence: drop it, keep a short pre-roll
+                self.seg_start = n - 3
+            return
+        trailing = len(voiced) - 1 - max(i for i, v in enumerate(voiced) if v)
+        if trailing >= self.args.pause * BLOCKS_PER_SEC:
+            self._cut(n - trailing + 3)  # keep 300 ms of the pause
+        elif n - self.seg_start >= self.args.max_segment * BLOCKS_PER_SEC:
+            lo = n - 5 * BLOCKS_PER_SEC  # cut at the quietest moment of the last 5 s
+            self._cut(lo + int(np.argmin(r.block_levels[lo:n])) + 1)
+
+    def _cut(self, end):
+        start, self.seg_start = self.seg_start, end
+        if sum(self.recorder.voiced[start:end]) < 3:  # under 0.3 s of speech: a click or breath
+            return
+        self.pending += 1
+        self.jobs.put((self.session, self.recorder.audio(start, end)))
+
+    # --- transcription worker thread --------------------------------------------
+    def _worker(self):
+        while True:
+            try:
+                session, audio = self.jobs.get(timeout=0.1)
+            except queue.Empty:
+                self._preview()
+                continue
+            text = ""
+            try:
+                text = self._transcribe(audio, final=True)
+            except Exception as e:
+                print(f"transcribe error: {e}", flush=True)
+            self.events.put(("segment", session, text))
+
+    def _preview(self):
+        if self.state != "recording" or self.args.no_preview:
+            return
+        session, start, n = self.session, self.seg_start, self.recorder.blocks()
+        if n - start < BLOCKS_PER_SEC or time.monotonic() - self.last_partial < 0.6:
+            return
+        if sum(self.recorder.voiced[start:n]) < 3:
+            return
+        self.last_partial = time.monotonic()
         try:
-            if len(audio) > SAMPLE_RATE * 0.3 and self.recorder.last_voice:
-                t0 = time.monotonic()
-                language = self._detect_language(audio)
-                result = self.model.transcribe(audio, fp16=self.fp16, language=language, temperature=0.0,
-                                               without_timestamps=True, condition_on_previous_text=False)
-                text = result["text"].strip()
-                print(f"[{time.monotonic() - t0:.2f}s {language}] {text}", flush=True)
+            text = self._transcribe(self.recorder.audio(start, n), final=False)
         except Exception as e:
-            print(f"transcribe error: {e}", flush=True)
-        self.events.put(("done", text))
+            print(f"preview error: {e}", flush=True)
+            return
+        self.events.put(("partial", session, start, text))
+
+    def _transcribe(self, audio, final):
+        t0 = time.monotonic()
+        language = self._detect_language(audio)
+        prompt = self.prompt if self.prompt and language == self.prompt_lang else None
+        result = self.model.transcribe(audio, fp16=self.fp16, language=language, temperature=0.0,
+                                       without_timestamps=True, condition_on_previous_text=False,
+                                       initial_prompt=prompt)
+        segments = result.get("segments", [])
+        if segments and all(s["no_speech_prob"] > 0.6 and s["avg_logprob"] < -1.0 for s in segments):
+            return ""  # whisper hallucinating on noise
+        text = result["text"].strip()
+        if final:
+            print(f"[{time.monotonic() - t0:.2f}s {language} {len(audio) / SAMPLE_RATE:.1f}s] {text}", flush=True)
+            if text:
+                self.prompt, self.prompt_lang = text[-200:], language
+        return text
 
     def _detect_language(self, audio):
         if len(self.languages) == 1:
@@ -420,24 +631,39 @@ class App:
         _, probs = self.model.detect_language(mel)
         return max(self.languages, key=lambda l: probs.get(l, 0.0))
 
-    def _paste(self, text, deadline):
-        # wait until the user lets go of the hotkey modifiers, or they'd combine with our Ctrl+V
-        if self.held & MODIFIERS and time.monotonic() < deadline:
-            QTimer.singleShot(20, lambda: self._paste(text, deadline))
+    # --- inserting (main thread, one text at a time, in order) ------------------
+    def _pump_inserts(self):
+        # wait while modifiers are held (e.g. the hotkey), or they'd combine with our keystrokes
+        if self.inserting or not self.inserts or self.held & MODIFIERS:
             return
+        text = self.inserts.popleft() + " "
+        self.inserting = True
+        if self.args.insert == "type":
+            threading.Thread(target=self._type, args=(text,), daemon=True).start()
+        else:
+            self._paste(text)
+
+    def _type(self, text):
+        try:
+            self.typer.type(text)
+        except Exception as e:
+            print(f"type error: {e}", flush=True)
+        self.events.put("inserted")
+
+    def _paste(self, text):
         clipboard = self.qapp.clipboard()
         previous = QMimeData()
         current = clipboard.mimeData()
         for fmt in (current.formats() if current else []):
             previous.setData(fmt, current.data(fmt))
-        clipboard.setText(text + " ")
+        clipboard.setText(text)
         QTimer.singleShot(40, self.paster.paste)
         QTimer.singleShot(1000, lambda: self._restore_clipboard(previous))
 
     def _restore_clipboard(self, previous):
         if previous.formats():
             self.qapp.clipboard().setMimeData(previous)
-        self.state = "idle"
+        self.inserting = False
 
     def run(self):
         signal.signal(signal.SIGINT, signal.SIG_DFL)
