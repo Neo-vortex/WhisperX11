@@ -53,8 +53,15 @@ else
 fi
 
 # --no-deps keeps pip from replacing your PyTorch with a different wheel
-.venv/bin/pip install --no-deps openai-whisper
+.venv/bin/pip install --no-deps openai-whisper silero-vad
 .venv/bin/pip install -r requirements.txt
+if [ "${XDG_SESSION_TYPE:-}" = wayland ]; then
+    # global hotkeys on Wayland read /dev/input (needs the 'input' group); typing uses wtype or ydotool
+    .venv/bin/pip install evdev || echo "evdev failed to build (needs python3-dev + linux headers)" >&2
+    command -v wtype >/dev/null || command -v ydotool >/dev/null || \
+        echo "note: install wtype (Sway/Hyprland/labwc) or ydotool (GNOME/KDE) for typing on Wayland" >&2
+    id -nG | grep -qw input || echo "note: add yourself to the 'input' group for hotkeys: sudo usermod -aG input \$USER" >&2
+fi
 
 ./download_model.sh "$MODEL"
 
